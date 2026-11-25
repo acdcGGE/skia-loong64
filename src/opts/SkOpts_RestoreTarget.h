@@ -20,6 +20,11 @@
     #undef SK_CPU_SSE_LEVEL
     #define SK_CPU_SSE_LEVEL SK_OLD_CPU_SSE_LEVEL
     #undef SK_OLD_CPU_SSE_LEVEL
+    #undef SK_CPU_LSX_LEVEL
+    #if defined(SK_OLD_CPU_LSX_LEVEL)
+        #define SK_CPU_LSX_LEVEL SK_OLD_CPU_LSX_LEVEL
+        #undef SK_OLD_CPU_LSX_LEVEL
+    #endif
 
     #if defined(__clang__)
         #pragma clang attribute pop

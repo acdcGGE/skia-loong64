@@ -9,6 +9,10 @@
 
 #include "include/private/base/SkOnce.h"
 
+#if defined(SK_CPU_LOONGARCH)
+    #include <sys/auxv.h>
+#endif
+
 #if defined(SK_CPU_X86)
     #if defined(_MSC_VER)
         #include <intrin.h>
@@ -69,6 +73,16 @@
                 if (abcd[1] & (1<<31)) { features |= SkCpu::AVX512VL; }
             }
         }
+        return features;
+    }
+#elif defined(SK_CPU_LOONGARCH)
+    static uint32_t read_cpu_features() {
+        uint32_t features = 0;
+        uint64_t hwcap = getauxval(AT_HWCAP);
+
+        if (hwcap & HWCAP_LOONGARCH_LSX)  { features |= SkCpu::SX; }
+        if (hwcap & HWCAP_LOONGARCH_LASX) { features |= SkCpu::ASX; }
+
         return features;
     }
 #else

@@ -42,6 +42,10 @@ struct SkCpu {
         SKX = AVX512F  | AVX512DQ | AVX512CD | AVX512BW | AVX512VL,
 
         ERMS       = 1 << 20,
+
+        // LoongArch LSX / LASX extensions.
+        SX         = 1 << 21,
+        ASX        = 1 << 22,
     };
 
     static void CacheRuntimeFeatures();
@@ -94,6 +98,14 @@ inline bool SkCpu::Supports(uint32_t mask) {
     features &= (SSE1 | SSE2 | SSE3 | SSSE3 | SSE41);
     #elif defined(SK_CPU_LIMIT_SSE2)
     features &= (SSE1 | SSE2);
+    #endif
+
+#elif SK_CPU_LOONGARCH
+    #if SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    features |= SX;
+    #endif
+    #if SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    features |= ASX;
     #endif
 
 #endif

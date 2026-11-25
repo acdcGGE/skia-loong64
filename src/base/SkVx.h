@@ -43,6 +43,11 @@
 #if SKVX_USE_SIMD
     #if SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE1
         #include <immintrin.h>
+    #elif SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+        #include <lasxintrin.h>
+        #include <lsxintrin.h>
+    #elif SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+        #include <lsxintrin.h>
     #elif defined(SK_ARM_HAS_NEON)
         #include <arm_neon.h>
     #elif defined(__wasm_simd128__)
@@ -485,9 +490,23 @@ SINT Vec<N,T> if_then_else(const Vec<N,M<T>>& cond, const Vec<N,T>& t, const Vec
                                                         sk_bit_cast<__m256i>(cond)));
     }
 #endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    if constexpr (N*sizeof(T) == 32) {
+        return sk_bit_cast<Vec<N,T>>(__lasx_xvbitsel_v(sk_bit_cast<__m256i>(e),
+                                                       sk_bit_cast<__m256i>(t),
+                                                       sk_bit_cast<__m256i>(cond)));
+    }
+#endif
 #if SKVX_USE_SIMD && SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE41
     if constexpr (N*sizeof(T) == 16) {
         return sk_bit_cast<Vec<N,T>>(_mm_blendv_epi8(sk_bit_cast<__m128i>(e),
+                                                     sk_bit_cast<__m128i>(t),
+                                                     sk_bit_cast<__m128i>(cond)));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N*sizeof(T) == 16) {
+        return sk_bit_cast<Vec<N,T>>(__lsx_vbitsel_v(sk_bit_cast<__m128i>(e),
                                                      sk_bit_cast<__m128i>(t),
                                                      sk_bit_cast<__m128i>(cond)));
     }
@@ -515,6 +534,20 @@ SINT bool any(const Vec<N,T>& x) {
 #if SKVX_USE_SIMD && SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_AVX2
     if constexpr (N*sizeof(T) == 32) {
         return !_mm256_testz_si256(sk_bit_cast<__m256i>(x), _mm256_set1_epi32(-1));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    if constexpr (N*sizeof(T) == 32) {
+        v8i32 retv = (v8i32)__lasx_xvmskltz_w(__lasx_xvslt_wu(__lasx_xvldi(0),
+                                                              sk_bit_cast<__m256i>(x)));
+        return (retv[0] | retv[4]) != 0b0000;
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N*sizeof(T) == 16) {
+        v4i32 retv = (v4i32)__lsx_vmskltz_w(__lsx_vslt_wu(__lsx_vldi(0),
+                                                          sk_bit_cast<__m128i>(x)));
+        return retv[0] != 0b0000;
     }
 #endif
 #if SKVX_USE_SIMD && SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE41
@@ -555,6 +588,20 @@ SINT bool all(const Vec<N,T>& x) {
     // correctness, so always just use the plain SSE version.
     if constexpr (N == 4 && sizeof(T) == 4) {
         return _mm_movemask_ps(_mm_cmpneq_ps(sk_bit_cast<__m128>(x), _mm_set1_ps(0))) == 0b1111;
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    if constexpr (N == 8 && sizeof(T) == 4) {
+        v8i32 retv = (v8i32)__lasx_xvmskltz_w(__lasx_xvslt_wu(__lasx_xvldi(0),
+                                                              sk_bit_cast<__m256i>(x)));
+        return (retv[0] & retv[4]) == 0b1111;
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N == 4 && sizeof(T) == 4) {
+        v4i32 retv = (v4i32)__lsx_vmskltz_w(__lsx_vslt_wu(__lsx_vldi(0),
+                                                          sk_bit_cast<__m128i>(x)));
+        return retv[0] == 0b1111;
     }
 #endif
 #if SKVX_USE_SIMD && defined(__aarch64__)
@@ -675,9 +722,19 @@ SIN Vec<N,int> lrint(const Vec<N,float>& x) {
         return sk_bit_cast<Vec<N,int>>(_mm256_cvtps_epi32(sk_bit_cast<__m256>(x)));
     }
 #endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    if constexpr (N == 8) {
+        return sk_bit_cast<Vec<N,int>>(__lasx_xvftint_w_s(sk_bit_cast<__m256>(x)));
+    }
+#endif
 #if SKVX_USE_SIMD && SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE1
     if constexpr (N == 4) {
         return sk_bit_cast<Vec<N,int>>(_mm_cvtps_epi32(sk_bit_cast<__m128>(x)));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N == 4) {
+        return sk_bit_cast<Vec<N,int>>(__lsx_vftint_w_s(sk_bit_cast<__m128>(x)));
     }
 #endif
     return join(lrint(x.lo),
@@ -775,13 +832,17 @@ SIN Vec<N,uint8_t> approx_scale(const Vec<N,uint8_t>& x, const Vec<N,uint8_t>& y
 // saturated_add(x,y) sums values and clamps to the maximum value instead of overflowing.
 SINT std::enable_if_t<std::is_unsigned_v<T>, Vec<N,T>> saturated_add(const Vec<N,T>& x,
                                                                      const Vec<N,T>& y) {
-#if SKVX_USE_SIMD && (SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE1 || defined(SK_ARM_HAS_NEON))
+#if SKVX_USE_SIMD && (SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE1 || defined(SK_ARM_HAS_NEON) || \
+        SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX)
     // Both SSE and ARM have 16-lane saturated adds, so use intrinsics for those and recurse down
     // or join up to take advantage.
     if constexpr (N == 16 && sizeof(T) == 1) {
         #if SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE1
         return sk_bit_cast<Vec<N,T>>(_mm_adds_epu8(sk_bit_cast<__m128i>(x),
                                                    sk_bit_cast<__m128i>(y)));
+        #elif SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+        return sk_bit_cast<Vec<N,T>>(__lsx_vsadd_bu(sk_bit_cast<__m128i>(x),
+                                                    sk_bit_cast<__m128i>(y)));
         #else  // SK_ARM_HAS_NEON
         return sk_bit_cast<Vec<N,T>>(vqaddq_u8(sk_bit_cast<uint8x16_t>(x),
                                                sk_bit_cast<uint8x16_t>(y)));
@@ -881,6 +942,15 @@ SIN Vec<N,uint16_t> mulhi(const Vec<N,uint16_t>& x,
     if constexpr (N == 8) {
         return sk_bit_cast<Vec<8,uint16_t>>(_mm_mulhi_epu16(sk_bit_cast<__m128i>(x),
                                                             sk_bit_cast<__m128i>(y)));
+    } else if constexpr (N < 8) {
+        return mulhi(join(x,x), join(y,y)).lo;
+    } else { // N > 8
+        return join(mulhi(x.lo, y.lo), mulhi(x.hi, y.hi));
+    }
+#elif SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N == 8) {
+        return sk_bit_cast<Vec<8,uint16_t>>(__lsx_vmuh_hu(sk_bit_cast<__m128i>(x),
+                                                          sk_bit_cast<__m128i>(y)));
     } else if constexpr (N < 8) {
         return mulhi(join(x,x), join(y,y)).lo;
     } else { // N > 8
@@ -986,6 +1056,36 @@ IMPL_LOAD4_TRANSPOSED(8, int16_t, vld4q_s16)
 IMPL_LOAD4_TRANSPOSED(16, int8_t, vld4q_s8)
 IMPL_LOAD4_TRANSPOSED(4, float, vld4q_f32)
 #undef IMPL_LOAD4_TRANSPOSED
+
+#elif SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+
+#define _LSX_TRANSPOSE4(row0, row1, row2, row3) \
+do {                                            \
+    __m128i __t0 = __lsx_vilvl_w (row1, row0);  \
+    __m128i __t1 = __lsx_vilvl_w (row3, row2);  \
+    __m128i __t2 = __lsx_vilvh_w (row1, row0);  \
+    __m128i __t3 = __lsx_vilvh_w (row3, row2);  \
+    (row0) = __lsx_vilvl_d (__t1, __t0);        \
+    (row1) = __lsx_vilvh_d (__t1, __t0);        \
+    (row2) = __lsx_vilvl_d (__t3, __t2);        \
+    (row3) = __lsx_vilvh_d (__t3, __t2);        \
+} while (0)
+
+SI void strided_load4(const int* v,
+                      Vec<4,int>& a,
+                      Vec<4,int>& b,
+                      Vec<4,int>& c,
+                      Vec<4,int>& d) {
+    __m128i a_ = __lsx_vld(v, 0);
+    __m128i b_ = __lsx_vld(v, 16);
+    __m128i c_ = __lsx_vld(v, 32);
+    __m128i d_ = __lsx_vld(v, 48);
+    _LSX_TRANSPOSE4(a_, b_, c_, d_);
+    a = sk_bit_cast<Vec<4,int>>(a_);
+    b = sk_bit_cast<Vec<4,int>>(b_);
+    c = sk_bit_cast<Vec<4,int>>(c_);
+    d = sk_bit_cast<Vec<4,int>>(d_);
+}
 
 #elif SKVX_USE_SIMD && SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE1
 

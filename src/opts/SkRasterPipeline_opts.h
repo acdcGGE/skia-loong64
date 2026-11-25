@@ -69,7 +69,7 @@ using NoCtx = const void*;
 
 #if defined(JUMPER_IS_SCALAR) || defined(JUMPER_IS_NEON) || defined(JUMPER_IS_HSW) || \
         defined(JUMPER_IS_SKX) || defined(JUMPER_IS_AVX) || defined(JUMPER_IS_SSE41) || \
-        defined(JUMPER_IS_SSE2)
+        defined(JUMPER_IS_SSE2) || defined(JUMPER_IS_LSX) || defined(JUMPER_IS_LASX)
     // Honor the existing setting
 #elif !defined(__clang__) && !defined(__GNUC__)
     #define JUMPER_IS_SCALAR
@@ -85,6 +85,10 @@ using NoCtx = const void*;
     #define JUMPER_IS_SSE41
 #elif SK_CPU_SSE_LEVEL >= SK_CPU_SSE_LEVEL_SSE2
     #define JUMPER_IS_SSE2
+#elif SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    #define JUMPER_IS_LASX
+#elif SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    #define JUMPER_IS_LSX
 #else
     #define JUMPER_IS_SCALAR
 #endif
@@ -107,6 +111,11 @@ using NoCtx = const void*;
     #include <math.h>
 #elif defined(JUMPER_IS_NEON)
     #include <arm_neon.h>
+#elif defined(JUMPER_IS_LASX)
+    #include <lasxintrin.h>
+    #include <lsxintrin.h>
+#elif defined(JUMPER_IS_LSX)
+    #include <lsxintrin.h>
 #else
     #include <immintrin.h>
 #endif
@@ -900,6 +909,393 @@ namespace SK_OPTS_NS {
         _mm_storeu_ps(ptr + 4, g);
         _mm_storeu_ps(ptr + 8, b);
         _mm_storeu_ps(ptr +12, a);
+    }
+#elif defined(JUMPER_IS_LASX)
+    // These are __m256 and __m256i, but friendlier and strongly-typed.
+    template <typename T> using V = Vec<8, T>;
+    using F   = V<float   >;
+    using I32 = V<int32_t>;
+    using U64 = V<uint64_t>;
+    using U32 = V<uint32_t>;
+    using U16 = V<uint16_t>;
+    using U8  = V<uint8_t >;
+
+    SI __m128i emulate_lasx_d_xr2vr_l(__m256i a) {
+        v4i64 tmp = a;
+        v2i64 al = {tmp[0], tmp[1]};
+        return (__m128i)al;
+    }
+
+    SI __m128i emulate_lasx_d_xr2vr_h(__m256i a) {
+        v4i64 tmp = a;
+        v2i64 ah = {tmp[2], tmp[3]};
+        return (__m128i)ah;
+    }
+
+    SI F if_then_else(I32 c, F t, F e) {
+        return sk_bit_cast<Vec<8,float>>(__lasx_xvbitsel_v(sk_bit_cast<__m256i>(e),
+                                                           sk_bit_cast<__m256i>(t),
+                                                           sk_bit_cast<__m256i>(c)));
+    }
+
+    SI I32 if_then_else(I32 c, I32 t, I32 e) {
+        return sk_bit_cast<Vec<8,int32_t>>(__lasx_xvbitsel_v(sk_bit_cast<__m256i>(e),
+                                                             sk_bit_cast<__m256i>(t),
+                                                             sk_bit_cast<__m256i>(c)));
+    }
+
+    SI F   min(F a, F b)        { return __lasx_xvfmin_s(a,b); }
+    SI F   max(F a, F b)        { return __lasx_xvfmax_s(a,b); }
+    SI I32 min(I32 a, I32 b)    { return __lasx_xvmin_w(a,b);  }
+    SI U32 min(U32 a, U32 b)    { return __lasx_xvmin_wu(a,b); }
+    SI I32 max(I32 a, I32 b)    { return __lasx_xvmax_w(a,b);  }
+    SI U32 max(U32 a, U32 b)    { return __lasx_xvmax_wu(a,b); }
+
+    SI F   mad(F f, F m, F a)   { return __lasx_xvfmadd_s(f, m, a);      }
+    SI F   nmad(F f, F m, F a)  { return __lasx_xvfmadd_s(-f, m, a);    }
+    SI F   abs_  (F v)          { return (F)__lasx_xvand_v((I32)v, (I32)(0-v));     }
+    SI I32 abs_(I32 v)          { return max(v, -v);                     }
+    SI F   rcp_approx(F v)      { return __lasx_xvfrecip_s(v);           }
+    SI F   rcp_precise (F v)    { F e = rcp_approx(v); return e * nmad(v, e, F() + 2.0f); }
+    SI F   rsqrt_approx (F v)   { return __lasx_xvfrsqrt_s(v);           }
+    SI F    sqrt_(F v)          { return __lasx_xvfsqrt_s(v);            }
+
+    SI U32 iround(F v) {
+        F t = F() + 0.5f;
+        return __lasx_xvftintrz_w_s(v + t);
+    }
+
+    SI U32 round(F v) {
+        F t = F() + 0.5f;
+        return __lasx_xvftintrz_w_s(v + t);
+    }
+
+    SI U32 round(F v, F scale) {
+        F t = F() + 0.5f;
+        return __lasx_xvftintrz_w_s(v * scale + t);
+    }
+
+    SI U16 pack(U32 v) {
+        return __lsx_vpickev_h(__lsx_vsat_wu(emulate_lasx_d_xr2vr_h(v), 15),
+                               __lsx_vsat_wu(emulate_lasx_d_xr2vr_l(v), 15));
+    }
+
+    SI U8 pack(U16 v) {
+        __m128i tmp = __lsx_vsat_hu(v, 7);
+        auto r = __lsx_vpickev_b(tmp, tmp);
+        return sk_unaligned_load<U8>(&r);
+    }
+
+    SI bool any(I32 c){
+        v8i32 retv = (v8i32)__lasx_xvmskltz_w(__lasx_xvslt_wu(__lasx_xvldi(0), c));
+        return (retv[0] | retv[4]) != 0b0000;
+    }
+
+    SI bool all(I32 c){
+        v8i32 retv = (v8i32)__lasx_xvmskltz_w(__lasx_xvslt_wu(__lasx_xvldi(0), c));
+        return (retv[0] & retv[4]) == 0b1111;
+    }
+
+    SI F floor_(F v) {
+        return __lasx_xvfrintrm_s(v);
+    }
+
+    SI F ceil_(F v) {
+        return __lasx_xvfrintrp_s(v);
+    }
+
+    template <typename T>
+    SI V<T> gather(const T* p, U32 ix) {
+        return V<T>{ p[ix[0]], p[ix[1]], p[ix[2]], p[ix[3]],
+                     p[ix[4]], p[ix[5]], p[ix[6]], p[ix[7]], };
+    }
+    template <typename T>
+    SI V<T> gather_unaligned(const T* p, U32 ix) {
+        return gather(p, ix);
+    }
+
+    template <typename V, typename S>
+    SI void scatter_masked(V src, S* dst, U32 ix, I32 mask) {
+        V before = gather(dst, ix);
+        V after = if_then_else(mask, src, before);
+        dst[ix[0]] = after[0];
+        dst[ix[1]] = after[1];
+        dst[ix[2]] = after[2];
+        dst[ix[3]] = after[3];
+        dst[ix[4]] = after[4];
+        dst[ix[5]] = after[5];
+        dst[ix[6]] = after[6];
+        dst[ix[7]] = after[7];
+    }
+
+    SI void load2(const uint16_t* ptr, U16* r, U16* g) {
+        U16 _0123 = __lsx_vld(ptr, 0),
+            _4567 = __lsx_vld(ptr, 16);
+        *r = __lsx_vpickev_h(__lsx_vsat_w(__lsx_vsrai_w(__lsx_vslli_w(_4567, 16), 16), 15),
+                             __lsx_vsat_w(__lsx_vsrai_w(__lsx_vslli_w(_0123, 16), 16), 15));
+        *g = __lsx_vpickev_h(__lsx_vsat_w(__lsx_vsrai_w(_4567, 16), 15),
+                             __lsx_vsat_w(__lsx_vsrai_w(_0123, 16), 15));
+    }
+    SI void store2(uint16_t* ptr, U16 r, U16 g) {
+        auto _0123 = __lsx_vilvl_h(g, r),
+             _4567 = __lsx_vilvh_h(g, r);
+        __lsx_vst(_0123, ptr, 0);
+        __lsx_vst(_4567, ptr, 16);
+    }
+
+    SI void load4(const uint16_t* ptr, U16* r, U16* g, U16* b, U16* a) {
+        __m128i _01 = __lsx_vld(ptr, 0),
+                _23 = __lsx_vld(ptr, 16),
+                _45 = __lsx_vld(ptr, 32),
+                _67 = __lsx_vld(ptr, 48);
+
+        auto _02 = __lsx_vilvl_h(_23, _01),     // r0 r2 g0 g2 b0 b2 a0 a2
+             _13 = __lsx_vilvh_h(_23, _01),     // r1 r3 g1 g3 b1 b3 a1 a3
+             _46 = __lsx_vilvl_h(_67, _45),
+             _57 = __lsx_vilvh_h(_67, _45);
+
+        auto rg0123 = __lsx_vilvl_h(_13, _02),  // r0 r1 r2 r3 g0 g1 g2 g3
+             ba0123 = __lsx_vilvh_h(_13, _02),  // b0 b1 b2 b3 a0 a1 a2 a3
+             rg4567 = __lsx_vilvl_h(_57, _46),
+             ba4567 = __lsx_vilvh_h(_57, _46);
+
+        *r = __lsx_vilvl_d(rg4567, rg0123);
+        *g = __lsx_vilvh_d(rg4567, rg0123);
+        *b = __lsx_vilvl_d(ba4567, ba0123);
+        *a = __lsx_vilvh_d(ba4567, ba0123);
+    }
+
+    SI void store4(uint16_t* ptr, U16 r, U16 g, U16 b, U16 a) {
+        auto rg0123 = __lsx_vilvl_h(g, r),      // r0 g0 r1 g1 r2 g2 r3 g3
+             rg4567 = __lsx_vilvh_h(g, r),      // r4 g4 r5 g5 r6 g6 r7 g7
+             ba0123 = __lsx_vilvl_h(a, b),
+             ba4567 = __lsx_vilvh_h(a, b);
+
+        auto _01 =__lsx_vilvl_w(ba0123, rg0123),
+             _23 =__lsx_vilvh_w(ba0123, rg0123),
+             _45 =__lsx_vilvl_w(ba4567, rg4567),
+             _67 =__lsx_vilvh_w(ba4567, rg4567);
+
+        __lsx_vst(_01, ptr, 0);
+        __lsx_vst(_23, ptr, 16);
+        __lsx_vst(_45, ptr, 32);
+        __lsx_vst(_67, ptr, 48);
+    }
+
+    SI void load4(const float* ptr, F* r, F* g, F* b, F* a) {
+        F _04 = (F)__lasx_xvpermi_q(__lasx_xvld(ptr, 0), __lasx_xvld(ptr, 64), 0x02);
+        F _15 = (F)__lasx_xvpermi_q(__lasx_xvld(ptr, 16), __lasx_xvld(ptr, 80), 0x02);
+        F _26 = (F)__lasx_xvpermi_q(__lasx_xvld(ptr, 32), __lasx_xvld(ptr, 96), 0x02);
+        F _37 = (F)__lasx_xvpermi_q(__lasx_xvld(ptr, 48), __lasx_xvld(ptr, 112), 0x02);
+
+        F rg0145 = (F)__lasx_xvilvl_w((__m256i)_15, (__m256i)_04),  // r0 r1 g0 g1 | r4 r5 g4 g5
+          ba0145 = (F)__lasx_xvilvh_w((__m256i)_15, (__m256i)_04),
+          rg2367 = (F)__lasx_xvilvl_w((__m256i)_37, (__m256i)_26),
+          ba2367 = (F)__lasx_xvilvh_w((__m256i)_37, (__m256i)_26);
+
+        *r = (F)__lasx_xvilvl_d((__m256i)rg2367, (__m256i)rg0145);
+        *g = (F)__lasx_xvilvh_d((__m256i)rg2367, (__m256i)rg0145);
+        *b = (F)__lasx_xvilvl_d((__m256i)ba2367, (__m256i)ba0145);
+        *a = (F)__lasx_xvilvh_d((__m256i)ba2367, (__m256i)ba0145);
+    }
+    SI void store4(float* ptr, F r, F g, F b, F a) {
+        F rg0145 = (F)__lasx_xvilvl_w((__m256i)g, (__m256i)r),         // r0 g0 r1 g1 | r4 g4 r5 g5
+          rg2367 = (F)__lasx_xvilvh_w((__m256i)g, (__m256i)r),         // r2 ...      | r6 ...
+          ba0145 = (F)__lasx_xvilvl_w((__m256i)a, (__m256i)b),         // b0 a0 b1 a1 | b4 a4 b5 a5
+          ba2367 = (F)__lasx_xvilvh_w((__m256i)a, (__m256i)b);         // b2 ...      | b6 ...
+
+        F _04 = (F)__lasx_xvilvl_d((__m256i)ba0145, (__m256i)rg0145),  // r0 g0 b0 a0 | r4 g4 b4 a4
+          _15 = (F)__lasx_xvilvh_d((__m256i)ba0145, (__m256i)rg0145),  // r1 ...      | r5 ...
+          _26 = (F)__lasx_xvilvl_d((__m256i)ba2367, (__m256i)rg2367),  // r2 ...      | r6 ...
+          _37 = (F)__lasx_xvilvh_d((__m256i)ba2367, (__m256i)rg2367);  // r3 ...      | r7 ...
+
+        F _01 = (F)__lasx_xvpermi_q((__m256i)_04, (__m256i)_15, 0x02),
+          _23 = (F)__lasx_xvpermi_q((__m256i)_26, (__m256i)_37, 0x02),
+          _45 = (F)__lasx_xvpermi_q((__m256i)_04, (__m256i)_15, 0x13),
+          _67 = (F)__lasx_xvpermi_q((__m256i)_26, (__m256i)_37, 0x13);
+        __lasx_xvst(_01, ptr, 0);
+        __lasx_xvst(_23, ptr, 32);
+        __lasx_xvst(_45, ptr, 64);
+        __lasx_xvst(_67, ptr, 96);
+    }
+
+#elif defined(JUMPER_IS_LSX)
+    template <typename T> using V = Vec<4, T>;
+    using F   = V<float   >;
+    using I32 = V<int32_t >;
+    using U64 = V<uint64_t>;
+    using U32 = V<uint32_t>;
+    using U16 = V<uint16_t>;
+    using U8  = V<uint8_t >;
+
+    #define _LSX_TRANSPOSE4_S(row0, row1, row2, row3)                          \
+    do {                                                                       \
+        __m128 __t0 = (__m128)__lsx_vilvl_w ((__m128i)row1, (__m128i)row0);    \
+        __m128 __t1 = (__m128)__lsx_vilvl_w ((__m128i)row3, (__m128i)row2);    \
+        __m128 __t2 = (__m128)__lsx_vilvh_w ((__m128i)row1, (__m128i)row0);    \
+        __m128 __t3 = (__m128)__lsx_vilvh_w ((__m128i)row3, (__m128i)row2);    \
+        (row0) = (__m128)__lsx_vilvl_d ((__m128i)__t1, (__m128i)__t0);         \
+        (row1) = (__m128)__lsx_vilvh_d ((__m128i)__t1, (__m128i)__t0);         \
+        (row2) = (__m128)__lsx_vilvl_d ((__m128i)__t3, (__m128i)__t2);         \
+        (row3) = (__m128)__lsx_vilvh_d ((__m128i)__t3, (__m128i)__t2);         \
+    } while (0)
+
+    SI F if_then_else(I32 c, F t, F e) {
+        return sk_bit_cast<Vec<4,float>>(__lsx_vbitsel_v(sk_bit_cast<__m128i>(e),
+                                                         sk_bit_cast<__m128i>(t),
+                                                         sk_bit_cast<__m128i>(c)));
+    }
+
+    SI I32 if_then_else(I32 c, I32 t, I32 e) {
+        return sk_bit_cast<Vec<4,int32_t>>(__lsx_vbitsel_v(sk_bit_cast<__m128i>(e),
+                                                           sk_bit_cast<__m128i>(t),
+                                                           sk_bit_cast<__m128i>(c)));
+    }
+
+    SI F   min(F a, F b)        { return __lsx_vfmin_s(a,b);     }
+    SI F   max(F a, F b)        { return __lsx_vfmax_s(a,b);     }
+    SI I32 min(I32 a, I32 b)    { return __lsx_vmin_w(a,b);      }
+    SI U32 min(U32 a, U32 b)    { return __lsx_vmin_wu(a,b);     }
+    SI I32 max(I32 a, I32 b)    { return __lsx_vmax_w(a,b);      }
+    SI U32 max(U32 a, U32 b)    { return __lsx_vmax_wu(a,b);     }
+
+    SI F   mad(F f, F m, F a)   { return __lsx_vfmadd_s(f, m, a);        }
+    SI F   nmad(F f, F m, F a)  { return __lsx_vfmadd_s(-f, m, a);      }
+    SI F   abs_(F v)            { return (F)__lsx_vand_v((I32)v, (I32)(0-v));       }
+    SI I32 abs_(I32 v)          { return max(v, -v);                     }
+    SI F   rcp_approx (F v)     { return __lsx_vfrecip_s(v);             }
+    SI F   rcp_precise (F v)    { F e = rcp_approx(v); return e * nmad(v, e, F() + 2.0f); }
+    SI F   rsqrt_approx (F v)   { return __lsx_vfrsqrt_s(v);             }
+    SI F    sqrt_(F v)          { return __lsx_vfsqrt_s (v);             }
+
+    SI U32 iround(F v) {
+        F t = F() + 0.5f;
+        return __lsx_vftintrz_w_s(v + t); }
+
+    SI U32 round(F v) {
+        F t = F() + 0.5f;
+        return __lsx_vftintrz_w_s(v + t); }
+
+    SI U32 round(F v, F scale) {
+        F t = F() + 0.5f;
+        return __lsx_vftintrz_w_s(v * scale + t); }
+
+    SI U16 pack(U32 v) {
+        __m128i tmp = __lsx_vsat_wu(v, 15);
+        auto p =  __lsx_vpickev_h(tmp, tmp);
+        return sk_unaligned_load<U16>(&p);  // We have two copies.  Return (the lower) one.
+    }
+
+    SI U8 pack(U16 v) {
+        auto r = widen_cast<__m128i>(v);
+        __m128i tmp = __lsx_vsat_hu(r, 7);
+        r =  __lsx_vpickev_b(tmp, tmp);
+        return sk_unaligned_load<U8>(&r);
+    }
+
+    SI bool any(I32 c){
+        v4i32 retv = (v4i32)__lsx_vmskltz_w(__lsx_vslt_wu(__lsx_vldi(0), c));
+        return retv[0] != 0b0000;
+    }
+
+    SI bool all(I32 c){
+        v4i32 retv = (v4i32)__lsx_vmskltz_w(__lsx_vslt_wu(__lsx_vldi(0), c));
+        return retv[0] == 0b1111;
+    }
+
+    SI F floor_(F v) {
+        return __lsx_vfrintrm_s(v);
+    }
+
+    SI F ceil_(F v) {
+        return __lsx_vfrintrp_s(v);
+    }
+
+    template <typename T>
+    SI V<T> gather(const T* p, U32 ix) {
+        return V<T>{p[ix[0]], p[ix[1]], p[ix[2]], p[ix[3]]};
+    }
+    // Using 'int*' prevents data from passing through floating-point registers.
+    SI F   gather(const int*    p, int ix0, int ix1, int ix2, int ix3) {
+       F ret = {0.0};
+       ret = (F)__lsx_vinsgr2vr_w(ret, p[ix0], 0);
+       ret = (F)__lsx_vinsgr2vr_w(ret, p[ix1], 1);
+       ret = (F)__lsx_vinsgr2vr_w(ret, p[ix2], 2);
+       ret = (F)__lsx_vinsgr2vr_w(ret, p[ix3], 3);
+       return ret;
+    }
+    template <typename T>
+    SI V<T> gather_unaligned(const T* p, U32 ix) {
+        return gather(p, ix);
+    }
+
+    template <typename V, typename S>
+    SI void scatter_masked(V src, S* dst, U32 ix, I32 mask) {
+        V before = gather(dst, ix);
+        V after = if_then_else(mask, src, before);
+        dst[ix[0]] = after[0];
+        dst[ix[1]] = after[1];
+        dst[ix[2]] = after[2];
+        dst[ix[3]] = after[3];
+    }
+
+    SI void load2(const uint16_t* ptr, U16* r, U16* g) {
+        __m128i _01 = __lsx_vld(ptr, 0);                  // r0 g0 r1 g1 r2 g2 r3 g3
+        auto rg     = __lsx_vshuf4i_h(_01, 0xD8);         // r0 r1 g0 g1 r2 r3 g2 g3
+
+        auto R = __lsx_vshuf4i_w(rg, 0x88);               // r0 r1 r2 r3 r0 r1 r2 r3
+        auto G = __lsx_vshuf4i_w(rg, 0xDD);               // g0 g1 g2 g3 g0 g1 g2 g3
+        *r = sk_unaligned_load<U16>(&R);
+        *g = sk_unaligned_load<U16>(&G);
+    }
+
+    SI void store2(uint16_t* ptr, U16 r, U16 g) {
+        U32 rg = __lsx_vilvl_h(widen_cast<__m128i>(g), widen_cast<__m128i>(r));
+        __lsx_vst(rg, ptr, 0);
+    }
+
+    SI void load4(const uint16_t* ptr, U16* r, U16* g, U16* b, U16* a) {
+        __m128i _01 = __lsx_vld(ptr,  0),    // r0 g0 b0 a0 r1 g1 b1 a1
+                _23 = __lsx_vld(ptr,  16);   // r2 g2 b2 a2 r3 g3 b3 a3
+
+        auto _02 = __lsx_vilvl_h(_23, _01),  // r0 r2 g0 g2 b0 b2 a0 a2
+             _13 = __lsx_vilvh_h(_23, _01);  // r1 r3 g1 g3 b1 b3 a1 a3
+
+        auto rg = __lsx_vilvl_h(_13, _02),   // r0 r1 r2 r3 g0 g1 g2 g3
+             ba = __lsx_vilvh_h(_13, _02);   // b0 b1 b2 b3 a0 a1 a2 a3
+
+        *r = sk_unaligned_load<U16>((uint16_t*)&rg + 0);
+        *g = sk_unaligned_load<U16>((uint16_t*)&rg + 4);
+        *b = sk_unaligned_load<U16>((uint16_t*)&ba + 0);
+        *a = sk_unaligned_load<U16>((uint16_t*)&ba + 4);
+    }
+
+    SI void store4(uint16_t* ptr, U16 r, U16 g, U16 b, U16 a) {
+        auto rg = __lsx_vilvl_h(widen_cast<__m128i>(g), widen_cast<__m128i>(r)),
+             ba = __lsx_vilvl_h(widen_cast<__m128i>(a), widen_cast<__m128i>(b));
+
+        __lsx_vst(__lsx_vilvl_w(ba, rg), ptr, 0);
+        __lsx_vst(__lsx_vilvh_w(ba, rg), ptr, 16);
+    }
+
+    SI void load4(const float* ptr, F* r, F* g, F* b, F* a) {
+        F _0 = (F)__lsx_vld(ptr, 0),
+          _1 = (F)__lsx_vld(ptr, 16),
+          _2 = (F)__lsx_vld(ptr, 32),
+          _3 = (F)__lsx_vld(ptr, 48);
+        _LSX_TRANSPOSE4_S(_0,_1,_2,_3);
+        *r = _0;
+        *g = _1;
+        *b = _2;
+        *a = _3;
+    }
+
+    SI void store4(float* ptr, F r, F g, F b, F a) {
+        _LSX_TRANSPOSE4_S(r,g,b,a);
+        __lsx_vst(r, ptr, 0);
+        __lsx_vst(g, ptr, 16);
+        __lsx_vst(b, ptr, 32);
+        __lsx_vst(a, ptr, 48);
     }
 #endif
 
@@ -2989,8 +3385,46 @@ SI void gradient_lookup(const SkRasterPipeline_GradientCtx* c, U32 idx, F t,
         fa = _mm256_permutevar8x32_ps(_mm256_loadu_ps(c->fs[3]), (__m256i)idx);
         ba = _mm256_permutevar8x32_ps(_mm256_loadu_ps(c->bs[3]), (__m256i)idx);
     } else
+#elif defined(JUMPER_IS_LASX)
+    if (c->stopCount <= 8) {
+        fr = (__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[0], 0), idx);
+        br = (__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[0], 0), idx);
+        fg = (__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[1], 0), idx);
+        bg = (__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[1], 0), idx);
+        fb = (__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[2], 0), idx);
+        bb = (__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[2], 0), idx);
+        fa = (__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[3], 0), idx);
+        ba = (__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[3], 0), idx);
+    } else
+#elif defined(JUMPER_IS_LSX)
+    if (c->stopCount <= 4) {
+        __m128i zero = __lsx_vldi(0);
+        fr = (__m128)__lsx_vshuf_w(idx, zero, __lsx_vld(c->fs[0], 0));
+        br = (__m128)__lsx_vshuf_w(idx, zero, __lsx_vld(c->bs[0], 0));
+        fg = (__m128)__lsx_vshuf_w(idx, zero, __lsx_vld(c->fs[1], 0));
+        bg = (__m128)__lsx_vshuf_w(idx, zero, __lsx_vld(c->bs[1], 0));
+        fb = (__m128)__lsx_vshuf_w(idx, zero, __lsx_vld(c->fs[2], 0));
+        bb = (__m128)__lsx_vshuf_w(idx, zero, __lsx_vld(c->bs[2], 0));
+        fa = (__m128)__lsx_vshuf_w(idx, zero, __lsx_vld(c->fs[3], 0));
+        ba = (__m128)__lsx_vshuf_w(idx, zero, __lsx_vld(c->bs[3], 0));
+    } else
 #endif
     {
+#if defined(JUMPER_IS_LSX)
+        // This can reduce some vpickve2gr instructions.
+        int i0 = __lsx_vpickve2gr_w(idx, 0);
+        int i1 = __lsx_vpickve2gr_w(idx, 1);
+        int i2 = __lsx_vpickve2gr_w(idx, 2);
+        int i3 = __lsx_vpickve2gr_w(idx, 3);
+        fr = gather((const int *)c->fs[0], i0, i1, i2, i3);
+        br = gather((const int *)c->bs[0], i0, i1, i2, i3);
+        fg = gather((const int *)c->fs[1], i0, i1, i2, i3);
+        bg = gather((const int *)c->bs[1], i0, i1, i2, i3);
+        fb = gather((const int *)c->fs[2], i0, i1, i2, i3);
+        bb = gather((const int *)c->bs[2], i0, i1, i2, i3);
+        fa = gather((const int *)c->fs[3], i0, i1, i2, i3);
+        ba = gather((const int *)c->bs[3], i0, i1, i2, i3);
+#else
         fr = gather(c->fs[0], idx);
         br = gather(c->bs[0], idx);
         fg = gather(c->fs[1], idx);
@@ -2999,6 +3433,7 @@ SI void gradient_lookup(const SkRasterPipeline_GradientCtx* c, U32 idx, F t,
         bb = gather(c->bs[2], idx);
         fa = gather(c->fs[3], idx);
         ba = gather(c->bs[3], idx);
+#endif
     }
 
     *r = mad(t, fr, br);
@@ -4645,7 +5080,7 @@ namespace lowp {
 
 #else  // We are compiling vector code with Clang... let's make some lowp stages!
 
-#if defined(JUMPER_IS_SKX) || defined(JUMPER_IS_HSW)
+#if defined(JUMPER_IS_SKX) || defined(JUMPER_IS_HSW) || defined(JUMPER_IS_LASX)
     template <typename T> using V = Vec<16, T>;
 #else
     template <typename T> using V = Vec<8, T>;
@@ -4994,6 +5429,14 @@ SI F rcp_precise(F x) {
     float32x4_t lo,hi;
     split(x, &lo,&hi);
     return join<F>(SK_OPTS_NS::rcp_precise(lo), SK_OPTS_NS::rcp_precise(hi));
+#elif defined(JUMPER_IS_LASX)
+    __m256 lo,hi;
+    split(x, &lo,&hi);
+    return join<F>(__lasx_xvfrecip_s(lo), __lasx_xvfrecip_s(hi));
+#elif defined(JUMPER_IS_LSX)
+    __m128 lo,hi;
+    split(x, &lo,&hi);
+    return join<F>(__lsx_vfrecip_s(lo), __lsx_vfrecip_s(hi));
 #else
     return 1.0f / x;
 #endif
@@ -5023,6 +5466,14 @@ SI F sqrt_(F x) {
     float32x4_t lo,hi;
     split(x, &lo,&hi);
     return join<F>(sqrt(lo), sqrt(hi));
+#elif defined(JUMPER_IS_LASX)
+    __m256 lo,hi;
+    split(x, &lo,&hi);
+    return join<F>(__lasx_xvfsqrt_s(lo), __lasx_xvfsqrt_s(hi));
+#elif defined(JUMPER_IS_LSX)
+    __m128 lo,hi;
+    split(x, &lo,&hi);
+    return join<F>(__lsx_vfsqrt_s(lo), __lsx_vfsqrt_s(hi));
 #else
     return F{
         sqrtf(x[0]), sqrtf(x[1]), sqrtf(x[2]), sqrtf(x[3]),
@@ -5046,6 +5497,14 @@ SI F floor_(F x) {
     __m128 lo,hi;
     split(x, &lo,&hi);
     return join<F>(_mm_floor_ps(lo), _mm_floor_ps(hi));
+#elif defined(JUMPER_IS_LASX)
+    __m256 lo,hi;
+    split(x, &lo,&hi);
+    return join<F>(__lasx_xvfrintrm_s(lo), __lasx_xvfrintrm_s(hi));
+#elif defined(JUMPER_IS_LSX)
+    __m128 lo,hi;
+    split(x, &lo,&hi);
+    return join<F>(__lsx_vfrintrm_s(lo), __lsx_vfrintrm_s(hi));
 #else
     F roundtrip = cast<F>(cast<I32>(x));
     return roundtrip - if_then_else(roundtrip > x, F_(1), F_(0));
@@ -5068,6 +5527,12 @@ SI I16 scaled_mult(I16 a, I16 b) {
     return vqrdmulhq_s16(a, b);
 #elif defined(JUMPER_IS_NEON)
     return vqrdmulhq_s16(a, b);
+#elif defined(JUMPER_IS_LASX)
+    I16 res = __lasx_xvmuh_h(a, b);
+    return __lasx_xvslli_h(res, 1);
+#elif defined(JUMPER_IS_LSX)
+    I16 res = __lsx_vmuh_h(a, b);
+    return __lsx_vslli_h(res, 1);
 #else
     const I32 roundingTerm = I32_(1 << 14);
     return cast<I16>((cast<I32>(a) * cast<I32>(b) + roundingTerm) >> 15);
@@ -5098,6 +5563,23 @@ SI F abs_(F x) { return sk_bit_cast<F>( sk_bit_cast<I32>(x) & 0x7fffffff ); }
 // ~~~~~~ Basic / misc. stages ~~~~~~ //
 
 STAGE_GG(seed_shader, NoCtx) {
+#if defined(JUMPER_IS_LSX)
+    __m128 val1 = {0.5f, 1.5f, 2.5f, 3.5f};
+    __m128 val2 = {4.5f, 5.5f, 6.5f, 7.5f};
+    __m128 val3 = {0.5f, 0.5f, 0.5f, 0.5f};
+
+    __m128i v_d = __lsx_vreplgr2vr_w(dx);
+
+    __m128 f_d = __lsx_vffint_s_w(v_d);
+    val1 = __lsx_vfadd_s(val1, f_d);
+    val2 = __lsx_vfadd_s(val2, f_d);
+    x = join<F>(val1, val2);
+
+    v_d = __lsx_vreplgr2vr_w(dy);
+    f_d = __lsx_vffint_s_w(v_d);
+    val3 = __lsx_vfadd_s(val3, f_d);
+    y = join<F>(val3, val3);
+#else
     static constexpr float iota[] = {
         0.5f, 1.5f, 2.5f, 3.5f, 4.5f, 5.5f, 6.5f, 7.5f,
         8.5f, 9.5f,10.5f,11.5f,12.5f,13.5f,14.5f,15.5f,
@@ -5106,6 +5588,7 @@ STAGE_GG(seed_shader, NoCtx) {
 
     x = cast<F>(I32_(dx)) + sk_unaligned_load<F>(iota);
     y = cast<F>(I32_(dy)) + 0.5f;
+#endif
 }
 
 STAGE_GG(matrix_translate, const float* m) {
@@ -5381,6 +5864,14 @@ SI void store(T* ptr, V v) {
         return join<U32>(_mm256_i32gather_epi32((const int*)ptr, lo, 4),
                          _mm256_i32gather_epi32((const int*)ptr, hi, 4));
     }
+#elif defined(JUMPER_IS_LASX)
+    template <typename V, typename T>
+    SI V gather(const T* ptr, U32 ix) {
+        return V{ ptr[ix[ 0]], ptr[ix[ 1]], ptr[ix[ 2]], ptr[ix[ 3]],
+                  ptr[ix[ 4]], ptr[ix[ 5]], ptr[ix[ 6]], ptr[ix[ 7]],
+                  ptr[ix[ 8]], ptr[ix[ 9]], ptr[ix[10]], ptr[ix[11]],
+                  ptr[ix[12]], ptr[ix[13]], ptr[ix[14]], ptr[ix[15]], };
+    }
 #else
     template <typename V, typename T>
     SI V gather(const T* ptr, U32 ix) {
@@ -5399,6 +5890,11 @@ SI void from_8888(U32 rgba, U16* r, U16* g, U16* b, U16* a) {
         return (U16)_mm256_packus_epi32(_mm512_castsi512_si256((__m512i)v),
                     _mm512_extracti64x4_epi64((__m512i)v, 1));
     };
+
+    *r = cast_U16(rgba & 65535) & 255;
+    *g = cast_U16(rgba & 65535) >>  8;
+    *b = cast_U16(rgba >>   16) & 255;
+    *a = cast_U16(rgba >>   16) >>  8;
 #elif defined(JUMPER_IS_HSW)
     // Swap the middle 128-bit lanes to make _mm256_packus_epi32() in cast_U16() work out nicely.
     __m256i _01,_23;
@@ -5412,15 +5908,51 @@ SI void from_8888(U32 rgba, U16* r, U16* g, U16* b, U16* a) {
         split(v, &_02,&_13);
         return (U16)_mm256_packus_epi32(_02,_13);
     };
-#else
-    auto cast_U16 = [](U32 v) -> U16 {
-        return cast<U16>(v);
-    };
-#endif
+
     *r = cast_U16(rgba & 65535) & 255;
     *g = cast_U16(rgba & 65535) >>  8;
     *b = cast_U16(rgba >>   16) & 255;
     *a = cast_U16(rgba >>   16) >>  8;
+#elif defined(JUMPER_IS_LSX)
+    __m128i _01, _23, rg, ba;
+    split(rgba, &_01, &_23);
+    rg = __lsx_vpickev_h(_23, _01);
+    ba = __lsx_vpickod_h(_23, _01);
+
+    __m128i mask_00ff = __lsx_vreplgr2vr_h(0xff);
+
+    *r = __lsx_vand_v(rg, mask_00ff);
+    *g = __lsx_vsrli_h(rg, 8);
+    *b = __lsx_vand_v(ba, mask_00ff);
+    *a = __lsx_vsrli_h(ba, 8);
+#elif defined(JUMPER_IS_LASX)
+    __m256i _01, _23;
+    split(rgba, &_01, &_23);
+    __m256i _02 = __lasx_xvpermi_q(_01, _23, 0x02),
+            _13 = __lasx_xvpermi_q(_01, _23, 0x13);
+    rgba = join<U32>(_02, _13);
+
+    auto cast_U16 = [](U32 v) -> U16 {
+        __m256i _02, _13;
+        split(v, &_02, &_13);
+        __m256i tmp0 = __lasx_xvsat_wu(_02, 15);
+        __m256i tmp1 = __lasx_xvsat_wu(_13, 15);
+        return __lasx_xvpickev_h(tmp1, tmp0);
+    };
+
+    *r = cast_U16(rgba & 65535) & 255;
+    *g = cast_U16(rgba & 65535) >>  8;
+    *b = cast_U16(rgba >>   16) & 255;
+    *a = cast_U16(rgba >>   16) >>  8;
+#else
+    auto cast_U16 = [](U32 v) -> U16 {
+        return cast<U16>(v);
+    };
+    *r = cast_U16(rgba & 65535) & 255;
+    *g = cast_U16(rgba & 65535) >>  8;
+    *b = cast_U16(rgba >>   16) & 255;
+    *a = cast_U16(rgba >>   16) >>  8;
+#endif
 }
 
 SI void load_8888_(const uint32_t* ptr, U16* r, U16* g, U16* b, U16* a) {
@@ -5435,6 +5967,30 @@ SI void load_8888_(const uint32_t* ptr, U16* r, U16* g, U16* b, U16* a) {
 #endif
 }
 SI void store_8888_(uint32_t* ptr, U16 r, U16 g, U16 b, U16 a) {
+#if defined(JUMPER_IS_LSX)
+    __m128i mask = __lsx_vreplgr2vr_h(255);
+    r = __lsx_vmin_hu(r, mask);
+    g = __lsx_vmin_hu(g, mask);
+    b = __lsx_vmin_hu(b, mask);
+    a = __lsx_vmin_hu(a, mask);
+
+    g = __lsx_vslli_h(g, 8);
+    r = r | g;
+    a = __lsx_vslli_h(a, 8);
+    a = a | b;
+
+    __m128i r_lo = __lsx_vsllwil_wu_hu(r, 0);
+    __m128i r_hi = __lsx_vexth_wu_hu(r);
+    __m128i a_lo = __lsx_vsllwil_wu_hu(a, 0);
+    __m128i a_hi = __lsx_vexth_wu_hu(a);
+
+    a_lo = __lsx_vslli_w(a_lo, 16);
+    a_hi = __lsx_vslli_w(a_hi, 16);
+
+    r = r_lo | a_lo;
+    a = r_hi | a_hi;
+    store(ptr, join<U32>(r, a));
+#else
     r = min(r, 255);
     g = min(g, 255);
     b = min(b, 255);
@@ -5451,6 +6007,7 @@ SI void store_8888_(uint32_t* ptr, U16 r, U16 g, U16 b, U16 a) {
 #else
     store(ptr, cast<U32>(r | (g<<8)) <<  0
              | cast<U32>(b | (a<<8)) << 16);
+#endif
 #endif
 }
 
@@ -5864,6 +6421,50 @@ SI void gradient_lookup(const SkRasterPipeline_GradientCtx* c, U32 idx, F t,
         ba = join<F>(_mm256_permutevar8x32_ps(_mm256_loadu_ps(c->bs[3]), lo),
                      _mm256_permutevar8x32_ps(_mm256_loadu_ps(c->bs[3]), hi));
     } else
+#elif defined(JUMPER_IS_LASX)
+    if (c->stopCount <= 8) {
+        __m256i lo, hi;
+        split(idx, &lo, &hi);
+
+        fr = join<F>((__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[0], 0), lo),
+                     (__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[0], 0), hi));
+        br = join<F>((__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[0], 0), lo),
+                     (__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[0], 0), hi));
+        fg = join<F>((__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[1], 0), lo),
+                     (__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[1], 0), hi));
+        bg = join<F>((__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[1], 0), lo),
+                     (__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[1], 0), hi));
+        fb = join<F>((__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[2], 0), lo),
+                     (__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[2], 0), hi));
+        bb = join<F>((__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[2], 0), lo),
+                     (__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[2], 0), hi));
+        fa = join<F>((__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[3], 0), lo),
+                     (__m256)__lasx_xvperm_w(__lasx_xvld(c->fs[3], 0), hi));
+        ba = join<F>((__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[3], 0), lo),
+                     (__m256)__lasx_xvperm_w(__lasx_xvld(c->bs[3], 0), hi));
+    } else
+#elif defined(JUMPER_IS_LSX)
+    if (c->stopCount <= 4) {
+        __m128i lo, hi;
+        split(idx, &lo, &hi);
+        __m128i zero = __lsx_vldi(0);
+        fr = join<F>((__m128)__lsx_vshuf_w(lo, zero, __lsx_vld(c->fs[0], 0)),
+                     (__m128)__lsx_vshuf_w(hi, zero, __lsx_vld(c->fs[0], 0)));
+        br = join<F>((__m128)__lsx_vshuf_w(lo, zero, __lsx_vld(c->bs[0], 0)),
+                     (__m128)__lsx_vshuf_w(hi, zero, __lsx_vld(c->bs[0], 0)));
+        fg = join<F>((__m128)__lsx_vshuf_w(lo, zero, __lsx_vld(c->fs[1], 0)),
+                     (__m128)__lsx_vshuf_w(hi, zero, __lsx_vld(c->fs[1], 0)));
+        bg = join<F>((__m128)__lsx_vshuf_w(lo, zero, __lsx_vld(c->bs[1], 0)),
+                     (__m128)__lsx_vshuf_w(hi, zero, __lsx_vld(c->bs[1], 0)));
+        fb = join<F>((__m128)__lsx_vshuf_w(lo, zero, __lsx_vld(c->fs[2], 0)),
+                     (__m128)__lsx_vshuf_w(hi, zero, __lsx_vld(c->fs[2], 0)));
+        bb = join<F>((__m128)__lsx_vshuf_w(lo, zero, __lsx_vld(c->bs[2], 0)),
+                     (__m128)__lsx_vshuf_w(hi, zero, __lsx_vld(c->bs[2], 0)));
+        fa = join<F>((__m128)__lsx_vshuf_w(lo, zero, __lsx_vld(c->fs[3], 0)),
+                     (__m128)__lsx_vshuf_w(hi, zero, __lsx_vld(c->fs[3], 0)));
+        ba = join<F>((__m128)__lsx_vshuf_w(lo, zero, __lsx_vld(c->bs[3], 0)),
+                     (__m128)__lsx_vshuf_w(hi, zero, __lsx_vld(c->bs[3], 0)));
+    } else
 #endif
     {
         fr = gather<F>(c->fs[0], idx);
@@ -5912,8 +6513,22 @@ STAGE_GP(evenly_spaced_2_stop_gradient, const SkRasterPipeline_EvenlySpaced2Stop
 STAGE_GP(bilerp_clamp_8888, const SkRasterPipeline_GatherCtx* ctx) {
     // Quantize sample point and transform into lerp coordinates converting them to 16.16 fixed
     // point number.
+#if defined(JUMPER_IS_LSX)
+    __m128 _01, _23, _45, _67;
+    __m128 v_tmp1 = {0.5f, 0.5f, 0.5f, 0.5f};
+    __m128 v_tmp2 = {65536.0f, 65536.0f, 65536.0f, 65536.0f};
+    split(x, &_01,&_23);
+    split(y, &_45,&_67);
+    __m128 val1 = __lsx_vfmadd_s(v_tmp2, _01, v_tmp1);
+    __m128 val2 = __lsx_vfmadd_s(v_tmp2, _23, v_tmp1);
+    __m128 val3 = __lsx_vfmadd_s(v_tmp2, _45, v_tmp1);
+    __m128 val4 = __lsx_vfmadd_s(v_tmp2, _67, v_tmp1);
+    I32 qx = cast<I32>((join<F>(__lsx_vfrintrm_s(val1), __lsx_vfrintrm_s(val2)))) - 32768,
+        qy = cast<I32>((join<F>(__lsx_vfrintrm_s(val3), __lsx_vfrintrm_s(val4)))) - 32768;
+#else
     I32 qx = cast<I32>(floor_(65536.0f * x + 0.5f)) - 32768,
         qy = cast<I32>(floor_(65536.0f * y + 0.5f)) - 32768;
+#endif
 
     // Calculate screen coordinates sx & sy by flooring qx and qy.
     I32 sx = qx >> 16,
@@ -5929,8 +6544,22 @@ STAGE_GP(bilerp_clamp_8888, const SkRasterPipeline_GatherCtx* ctx) {
     // Calculate {qx} - 1 and {qy} - 1 where the {} operation is handled by the cast, and the - 1
     // is handled by the ^ 0x8000, dividing by 2 is deferred and handled in lerpX and lerpY in
     // order to use the full 16-bit resolution.
+#if defined(JUMPER_IS_LSX)
+    __m128i qx_lo, qx_hi, qy_lo, qy_hi;
+    split(qx, &qx_lo, &qx_hi);
+    split(qy, &qy_lo, &qy_hi);
+    __m128i temp = __lsx_vreplgr2vr_w(0x8000);
+    qx_lo = __lsx_vxor_v(qx_lo, temp);
+    qx_hi = __lsx_vxor_v(qx_hi, temp);
+    qy_lo = __lsx_vxor_v(qy_lo, temp);
+    qy_hi = __lsx_vxor_v(qy_hi, temp);
+
+    I16 tx = __lsx_vpickev_h(qx_hi, qx_lo);
+    I16 ty = __lsx_vpickev_h(qy_hi, qy_lo);
+#else
     I16 tx = cast<I16>(qx ^ 0x8000),
         ty = cast<I16>(qy ^ 0x8000);
+#endif
 
     // Substituting the {qx} by the equation for tx from above into the lerp equation where v is
     // the lerped value:
